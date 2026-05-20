@@ -277,8 +277,8 @@ export const MAP_LAYOUT: number[][] = [
   [0, 0, 0, 0, 2, 0, 0, 0, 0],
 ];
 
-// Paths from each spawn to the core
-export const PATHS: number[][][] = [
+// Paths from each spawn to the core — these are defaults, overridden by map selection
+export let PATHS: number[][][] = [
   // North spawn (0,4) → core (4,4)
   [[0,4],[1,4],[2,4],[3,4],[4,4]],
   // West spawn (3,0) → core (4,4)
@@ -288,6 +288,10 @@ export const PATHS: number[][][] = [
   // South spawn (8,4) → core (4,4)
   [[8,4],[7,4],[6,4],[5,4],[4,4]],
 ];
+
+export function setPaths(newPaths: number[][][]) {
+  PATHS = newPaths;
+}
 
 // Convert grid coords to world position
 export function gridToWorld(row: number, col: number): [number, number, number] {

@@ -31,6 +31,7 @@ import {
   gridToWorld,
   worldToGrid,
   createInitialState,
+  setPaths,
   type GameStateData,
 } from "./constants";
 import { createEnvironment, animateEnvironment } from "./environment";
@@ -65,6 +66,8 @@ import { createHUD } from "./hud";
 import { createMinimap, updateMinimap } from "./minimap";
 import { createComboState, registerKill, updateCombo, type ComboState } from "./combo";
 import { Difficulty, DIFFICULTY_SETTINGS, type DifficultySettings } from "./difficulty";
+import { MAPS, type MapDef } from "./maps";
+import { createAbilities, useAbility, updateAbilityCooldowns, AbilityType, type Ability } from "./abilities";
 import {
   initAudio,
   playTowerPlace,
@@ -91,6 +94,7 @@ import {
   flashDamageVignette,
   updateDamageVignette,
 } from "./effects";
+import { createAbilityBar, updateAbilityBar } from "./ability-hud";
 import {
   createAchievements,
   checkAchievements,
@@ -129,6 +133,8 @@ let achievements: Achievement[] = createAchievements();
 let stats: GameStats = loadStats();
 let sessionStats: GameStats = createGameStats();
 let coreHPAtWaveStart = 20;
+let currentMap: MapDef = MAPS[0];
+let abilities: Ability[] = createAbilities();
 
 const raycaster = new Raycaster();
 const mouse = new Vector2();
@@ -238,6 +244,9 @@ async function init() {
   // Create damage vignette
   createDamageVignette();
 
+  // Create ability bar
+  createAbilityBar();
+
   // Load achievements
   loadAchievementState(achievements);
 
@@ -271,6 +280,13 @@ async function init() {
       if (e.key === "2") startGame(Difficulty.Normal);
       if (e.key === "3") startGame(Difficulty.Hard);
       if (e.key === "4") startGame(Difficulty.Endless);
+    }
+    // Ability keys
+    if (gameState.phase === GamePhase.Wave) {
+      if (e.key === "q" || e.key === "Q") tryUseAbility(AbilityType.AirStrike);
+      if (e.key === "w" || e.key === "W") tryUseAbility(AbilityType.FreezeAll);
+      if (e.key === "e" || e.key === "E") tryUseAbility(AbilityType.ChainLightning);
+      if (e.key === "r" || e.key === "R") tryUseAbility(AbilityType.Repair);
     }
   });
 
@@ -311,6 +327,9 @@ async function init() {
     updateTrails(dt, scene);
     updateFloatingScores(dt);
     updateDamageVignette(gameState.coreHP, gameState.maxCoreHP);
+
+    // Update ability bar
+    updateAbilityBar(abilities, gameState.credits, gameState.phase === GamePhase.Wave);
 
     hud.update(gameState);
     requestAnimationFrame(gameLoop);
@@ -447,6 +466,34 @@ function togglePause() {
 
 function triggerShake(intensity: number) {
   shakeIntensity = Math.max(shakeIntensity, intensity);
+}
+
+// ─── Abilities ───
+
+function tryUseAbility(type: AbilityType) {
+  const ability = abilities.find((a) => a.type === type);
+  if (!ability) return;
+  if (ability.currentCooldown > 0) {
+    hud.showNotification(`${ability.name} on cooldown (${Math.ceil(ability.currentCooldown)}s)`, "#ff4444", 1000);
+    return;
+  }
+  if (gameState.credits < ability.cost) {
+    hud.showNotification(`Need ⚡${ability.cost} for ${ability.name}`, "#ff4444", 1000);
+    return;
+  }
+
+  gameState.credits -= ability.cost;
+  const result = useAbility(ability, enemies, scene, gameState.coreHP, gameState.maxCoreHP);
+  gameState.totalEnemiesKilled += result.kills;
+  gameState.credits += result.rewards;
+  gameState.score += result.kills * 100;
+  if (result.coreHPRestored > 0) {
+    gameState.coreHP = Math.min(gameState.maxCoreHP, gameState.coreHP + result.coreHPRestored);
+    hud.showNotification(`Core repaired +${result.coreHPRestored} HP`, "#00ff88", 2000);
+  } else {
+    hud.showNotification(`${ability.name}!`, `#${ability.color.toString(16).padStart(6, "0")}`, 1500);
+  }
+  triggerShake(0.3);
 }
 
 // ─── Tower Placement ───
@@ -753,6 +800,9 @@ function update(dt: number, time: number) {
 
   // Update combo state
   updateCombo(combo, time);
+
+  // Update ability cooldowns
+  updateAbilityCooldowns(abilities, dt);
 
   // Animate towers
   animateTowers(towers, time);
