@@ -1,5 +1,5 @@
 // Neon Bastion - VR Tower Defense
-// Main entry point
+// Main entry point — v2 with combo, minimap, difficulty, screen shake
 
 import {
   World,
@@ -45,7 +45,6 @@ import {
 import {
   createEnemy,
   updateEnemies,
-  damageEnemy,
   type Enemy,
 } from "./enemies";
 import {
@@ -63,6 +62,9 @@ import {
   type WaveDefinition,
 } from "./waves";
 import { createHUD } from "./hud";
+import { createMinimap, updateMinimap } from "./minimap";
+import { createComboState, registerKill, updateCombo, type ComboState } from "./combo";
+import { Difficulty, DIFFICULTY_SETTINGS, type DifficultySettings } from "./difficulty";
 import {
   initAudio,
   playTowerPlace,
@@ -79,6 +81,27 @@ import {
   stopMusic,
   setMusicIntensity,
 } from "./audio";
+import {
+  updateTrails,
+  clearTrails,
+  spawnTrail,
+  updateFloatingScores,
+  clearFloatingScores,
+  createDamageVignette,
+  flashDamageVignette,
+  updateDamageVignette,
+} from "./effects";
+import {
+  createAchievements,
+  checkAchievements,
+  createGameStats,
+  loadStats,
+  saveStats,
+  loadAchievementState,
+  saveAchievements,
+  type Achievement,
+  type GameStats,
+} from "./achievements";
 
 // ─── Global State ───
 let gameState: GameStateData;
@@ -87,6 +110,7 @@ let enemies: Enemy[] = [];
 let gridState: number[][];
 let scene: any;
 let camera: any;
+let world: any;
 
 let hoveredCell: [number, number] | null = null;
 let hoverIndicator: Mesh | null = null;
@@ -95,15 +119,25 @@ let selectedPlacedTower: Tower | null = null;
 
 let currentWave: WaveDefinition | null = null;
 let spawnQueue: WaveDefinition["enemies"] = [];
-let spawnTimer = 0;
 let waveStartTime = 0;
 
 let hud: ReturnType<typeof createHUD>;
 let envData: ReturnType<typeof createEnvironment>;
+let combo: ComboState;
+let difficulty: DifficultySettings = DIFFICULTY_SETTINGS[Difficulty.Normal];
+let achievements: Achievement[] = createAchievements();
+let stats: GameStats = loadStats();
+let sessionStats: GameStats = createGameStats();
+let coreHPAtWaveStart = 20;
 
 const raycaster = new Raycaster();
 const mouse = new Vector2();
 let groundPlane: Mesh;
+
+// Screen shake
+let shakeIntensity = 0;
+let shakeDecay = 5;
+let cameraBasePos = new Vector3(0, 12, 10);
 
 // ─── Initialization ───
 
@@ -119,7 +153,7 @@ async function init() {
   }
 
   // Create world
-  const world = await World.create(container, {
+  world = await World.create(container, {
     xr: hasXR,
     render: {
       near: 0.01,
@@ -145,18 +179,19 @@ async function init() {
 
   // Init audio on first interaction
   let audioInitialized = false;
-  const initAudioOnClick = () => {
+  const initAudioOnInteraction = () => {
     if (!audioInitialized) {
       initAudio();
       audioInitialized = true;
     }
   };
-  document.addEventListener("click", initAudioOnClick, { once: false });
-  document.addEventListener("keydown", initAudioOnClick, { once: false });
+  document.addEventListener("click", initAudioOnInteraction);
+  document.addEventListener("keydown", initAudioOnInteraction);
 
   // Init game state
   gameState = createInitialState();
   gridState = MAP_LAYOUT.map((row) => [...row]);
+  combo = createComboState();
 
   // Create environment
   envData = createEnvironment(scene);
@@ -197,14 +232,23 @@ async function init() {
   rangePreview.visible = false;
   scene.add(rangePreview);
 
+  // Create minimap
+  createMinimap();
+
+  // Create damage vignette
+  createDamageVignette();
+
+  // Load achievements
+  loadAchievementState(achievements);
+
   // Create HUD
   hud = createHUD({
     onTowerSelect: selectTowerType,
-    onStartGame: startGame,
+    onStartGame: () => startGame(Difficulty.Normal),
     onStartWave: startNextWave,
     onUpgradeTower: tryUpgradeSelectedTower,
     onSellTower: trySellSelectedTower,
-    onRestartGame: restartGame,
+    onRestartGame: () => startGame(Difficulty.Normal),
     onTogglePause: togglePause,
   });
 
@@ -213,11 +257,21 @@ async function init() {
   container.addEventListener("click", onMouseClick);
   container.addEventListener("contextmenu", (e) => {
     e.preventDefault();
-    // Right-click to deselect
     gameState.selectedTower = null;
     selectedPlacedTower = null;
     hud.hideSelectedTower();
     hideRangePreview();
+    towers.forEach((t) => { if (t.rangeIndicator) t.rangeIndicator.visible = false; });
+  });
+
+  // Difficulty selection keys on title screen
+  document.addEventListener("keydown", (e) => {
+    if (gameState.phase === GamePhase.Title) {
+      if (e.key === "1") startGame(Difficulty.Easy);
+      if (e.key === "2") startGame(Difficulty.Normal);
+      if (e.key === "3") startGame(Difficulty.Hard);
+      if (e.key === "4") startGame(Difficulty.Endless);
+    }
   });
 
   // Game loop
@@ -241,6 +295,23 @@ async function init() {
       envData.pathMeshes
     );
 
+    // Screen shake
+    if (shakeIntensity > 0.001 && camera) {
+      const sx = (Math.random() - 0.5) * shakeIntensity;
+      const sy = (Math.random() - 0.5) * shakeIntensity;
+      camera.position.x = cameraBasePos.x + sx;
+      camera.position.y = cameraBasePos.y + sy;
+      shakeIntensity *= Math.exp(-shakeDecay * dt);
+    }
+
+    // Update minimap
+    updateMinimap(gridState, towers, enemies);
+
+    // Update visual effects
+    updateTrails(dt, scene);
+    updateFloatingScores(dt);
+    updateDamageVignette(gameState.coreHP, gameState.maxCoreHP);
+
     hud.update(gameState);
     requestAnimationFrame(gameLoop);
   }
@@ -250,10 +321,16 @@ async function init() {
 
 // ─── Game Flow ───
 
-function startGame() {
+function startGame(diff: Difficulty) {
+  difficulty = DIFFICULTY_SETTINGS[diff];
   gameState = createInitialState();
   gameState.phase = GamePhase.Building;
+  gameState.credits = difficulty.startCredits;
+  gameState.coreHP = difficulty.coreHP;
+  gameState.maxCoreHP = difficulty.coreHP;
+  gameState.maxWaves = difficulty.maxWaves;
   gridState = MAP_LAYOUT.map((row) => [...row]);
+  combo = createComboState();
 
   // Clear existing towers and enemies
   towers.forEach((t) => {
@@ -264,13 +341,17 @@ function startGame() {
   enemies.forEach((e) => scene.remove(e.group));
   enemies = [];
   clearAllProjectiles(scene);
+  clearTrails(scene);
+  clearFloatingScores();
   selectedPlacedTower = null;
+  sessionStats = createGameStats();
+  stats.gamesPlayed++;
 
   initAudio();
   startMusic();
   setMusicIntensity(0.2);
   playBuildPhaseStart();
-  hud.showNotification("DEFEND THE CORE!", "#00ffff", 3000);
+  hud.showNotification(`${difficulty.name} MODE — DEFEND THE CORE!`, "#00ffff", 3000);
 }
 
 function startNextWave() {
@@ -282,15 +363,16 @@ function startNextWave() {
 
   currentWave = generateWave(gameState.wave);
   spawnQueue = [...currentWave.enemies];
-  spawnTimer = 0;
   waveStartTime = performance.now() / 1000;
 
   const isBoss = currentWave.isBoss;
+  coreHPAtWaveStart = gameState.coreHP;
   setMusicIntensity(isBoss ? 0.9 : 0.4 + gameState.wave * 0.02);
   playWaveStart();
 
   if (isBoss) {
     hud.showNotification("⚠ BOSS INCOMING ⚠", "#ff0088", 3000);
+    triggerShake(0.3);
   } else {
     hud.showNotification(`WAVE ${gameState.wave}`, "#00ffff", 2000);
   }
@@ -300,12 +382,34 @@ function onWaveComplete() {
   if (!currentWave) return;
 
   gameState.phase = GamePhase.BetweenWaves;
-  gameState.credits += currentWave.bonusCredits;
-  gameState.score += currentWave.bonusCredits * 2;
+  const bonus = Math.floor(currentWave.bonusCredits * difficulty.creditMult);
+  gameState.credits += bonus;
+  gameState.score += bonus * 2;
+
+  // Track stats
+  sessionStats.totalWaves++;
+  sessionStats.totalCreditsEarned += bonus;
+  if (gameState.coreHP >= coreHPAtWaveStart) {
+    sessionStats.perfectWaves++;
+  }
+  stats.totalWaves++;
+  if (gameState.wave > stats.highestWave) stats.highestWave = gameState.wave;
+  if (gameState.score > stats.highScore) stats.highScore = gameState.score;
+
+  // Check achievements
+  const newAchievements = checkAchievements(achievements, { ...stats, ...sessionStats });
+  newAchievements.forEach((a) => {
+    hud.showNotification(`${a.icon} ${a.name} UNLOCKED!`, "#ffcc00", 3000);
+  });
+  saveStats(stats);
+  saveAchievements(achievements);
 
   // Check victory
   if (gameState.wave >= gameState.maxWaves) {
     gameState.phase = GamePhase.Victory;
+    stats.gamesWon++;
+    saveStats(stats);
+    saveAchievements(achievements);
     stopMusic();
     playVictory();
     hud.showNotification("VICTORY!", "#00ff88", 5000);
@@ -315,33 +419,34 @@ function onWaveComplete() {
   setMusicIntensity(0.2);
   playWaveComplete();
   playBuildPhaseStart();
-  hud.showNotification(`WAVE CLEAR! +⚡${currentWave.bonusCredits}`, "#00ff88", 2500);
+
+  const comboBonus = combo.totalBonusCredits > 0 ? ` (combo +⚡${combo.totalBonusCredits})` : "";
+  hud.showNotification(`WAVE CLEAR! +⚡${bonus}${comboBonus}`, "#00ff88", 2500);
 }
 
 function onCoreDamaged(damage: number) {
   gameState.coreHP = Math.max(0, gameState.coreHP - damage);
   playCoreHit();
-
-  // Screen shake effect via core light
-  envData.coreLight.intensity = 5;
-  setTimeout(() => { envData.coreLight.intensity = 2; }, 100);
+  triggerShake(0.5);
+  flashDamageVignette();
 
   if (gameState.coreHP <= 0) {
     gameState.phase = GamePhase.GameOver;
     stopMusic();
     playGameOver();
+    triggerShake(1.5);
     hud.showNotification("CORE DESTROYED", "#ff4444", 5000);
   }
-}
-
-function restartGame() {
-  startGame();
 }
 
 function togglePause() {
   if (gameState.phase === GamePhase.Wave || gameState.phase === GamePhase.Building || gameState.phase === GamePhase.BetweenWaves) {
     gameState.isPaused = !gameState.isPaused;
   }
+}
+
+function triggerShake(intensity: number) {
+  shakeIntensity = Math.max(shakeIntensity, intensity);
 }
 
 // ─── Tower Placement ───
@@ -352,6 +457,7 @@ function selectTowerType(type: TowerType) {
   selectedPlacedTower = null;
   hud.hideSelectedTower();
   playSelect();
+  towers.forEach((t) => { if (t.rangeIndicator) t.rangeIndicator.visible = false; });
 
   if (gameState.selectedTower) {
     updateRangePreview();
@@ -367,7 +473,6 @@ function placeTower(row: number, col: number) {
   if (gameState.credits < def.cost) return;
   if (gridState[row][col] !== CELL_EMPTY) return;
 
-  // Place tower
   const tower = createTower(gameState.selectedTower, row, col);
   scene.add(tower.group);
   if (tower.rangeIndicator) scene.add(tower.rangeIndicator);
@@ -377,9 +482,7 @@ function placeTower(row: number, col: number) {
   gameState.credits -= def.cost;
   gameState.score += 10;
 
-  // Check for shield buff
   applyShieldBuffs();
-
   playTowerPlace();
 }
 
@@ -401,7 +504,6 @@ function trySellSelectedTower() {
   const value = getSellValue(selectedPlacedTower);
   gameState.credits += value;
 
-  // Remove tower
   scene.remove(selectedPlacedTower.group);
   if (selectedPlacedTower.rangeIndicator) scene.remove(selectedPlacedTower.rangeIndicator);
   gridState[selectedPlacedTower.row][selectedPlacedTower.col] = CELL_EMPTY;
@@ -415,18 +517,13 @@ function trySellSelectedTower() {
 }
 
 function applyShieldBuffs() {
-  // Reset all buffs
   towers.forEach((t) => { t.buffed = false; });
-
-  // Apply shield generator buffs
   const shields = towers.filter((t) => t.type === TowerType.Shield);
   shields.forEach((shield) => {
     towers.forEach((t) => {
       if (t === shield) return;
       const dist = shield.group.position.distanceTo(t.group.position);
-      if (dist <= shield.currentRange) {
-        t.buffed = true;
-      }
+      if (dist <= shield.currentRange) t.buffed = true;
     });
   });
 }
@@ -435,17 +532,25 @@ function applyShieldBuffs() {
 
 function updateTowerAI(dt: number, time: number) {
   towers.forEach((tower) => {
-    if (tower.type === TowerType.Shield) return; // Shields don't shoot
+    if (tower.type === TowerType.Shield) return;
 
-    // Find target - closest enemy in range
+    // Find target - prioritize: boss > closest to core > closest to tower
     let bestTarget: Enemy | null = null;
-    let bestDist = tower.currentRange;
+    let bestScore = -Infinity;
 
     enemies.forEach((enemy) => {
       if (!enemy.alive) return;
       const dist = tower.group.position.distanceTo(enemy.group.position);
-      if (dist < bestDist) {
-        bestDist = dist;
+      if (dist > tower.currentRange) return;
+
+      // Score: prioritize enemies closer to the core, bosses, low HP
+      let score = 100 - dist;
+      score += enemy.waypointIndex * 10; // further along path = higher priority
+      if (enemy.type === "boss") score += 50;
+      if (enemy.hp / enemy.maxHp < 0.3) score += 20; // finish off low HP
+
+      if (score > bestScore) {
+        bestScore = score;
         bestTarget = enemy;
       }
     });
@@ -489,8 +594,10 @@ function updateSpawning(dt: number, time: number) {
 
   while (spawnQueue.length > 0 && spawnQueue[0].delay <= elapsed) {
     const spawn = spawnQueue.shift()!;
-    const hpMult = getWaveHPMultiplier(gameState.wave);
+    const hpMult = getWaveHPMultiplier(gameState.wave) * difficulty.enemyHPMult;
     const enemy = createEnemy(spawn.type, spawn.pathIndex, hpMult);
+    enemy.speed *= difficulty.enemySpeedMult;
+    enemy.baseSpeed *= difficulty.enemySpeedMult;
     scene.add(enemy.group);
     enemies.push(enemy);
     gameState.enemiesAlive++;
@@ -504,7 +611,6 @@ function onMouseMove(event: MouseEvent) {
   mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 
-  // Raycast to ground
   if (!camera) return;
   raycaster.setFromCamera(mouse, camera);
   const intersects = raycaster.intersectObject(groundPlane);
@@ -521,14 +627,12 @@ function onMouseMove(event: MouseEvent) {
         hoverIndicator.visible = true;
         hoverIndicator.position.set(wx, 0.02, wz);
 
-        // Color based on buildability
         const canBuild = gridState[row][col] === CELL_EMPTY && gameState.selectedTower;
         const mat = hoverIndicator.material as MeshBasicMaterial;
         mat.color.setHex(canBuild ? 0x00ff88 : 0xff4444);
         mat.opacity = canBuild ? 0.3 : 0.15;
       }
 
-      // Update range preview position
       if (gameState.selectedTower && rangePreview) {
         rangePreview.visible = true;
         rangePreview.position.set(wx, 0.015, wz);
@@ -554,40 +658,28 @@ function onMouseClick(event: MouseEvent) {
   if (!hoveredCell) return;
   const [row, col] = hoveredCell;
 
-  // Try to place tower
   if (gameState.selectedTower && gridState[row][col] === CELL_EMPTY) {
     placeTower(row, col);
     return;
   }
 
-  // Try to select placed tower
   if (gridState[row][col] === CELL_TOWER) {
     const tower = towers.find((t) => t.row === row && t.col === col);
     if (tower) {
       selectedPlacedTower = tower;
       gameState.selectedTower = null;
-
-      // Show range indicator
-      towers.forEach((t) => {
-        if (t.rangeIndicator) t.rangeIndicator.visible = false;
-      });
+      towers.forEach((t) => { if (t.rangeIndicator) t.rangeIndicator.visible = false; });
       if (tower.rangeIndicator) tower.rangeIndicator.visible = true;
-
       hud.showSelectedTower(tower);
       playSelect();
     }
     return;
   }
 
-  // Deselect
-  if (gridState[row][col] !== CELL_EMPTY) {
-    selectedPlacedTower = null;
-    gameState.selectedTower = null;
-    hud.hideSelectedTower();
-    towers.forEach((t) => {
-      if (t.rangeIndicator) t.rangeIndicator.visible = false;
-    });
-  }
+  selectedPlacedTower = null;
+  gameState.selectedTower = null;
+  hud.hideSelectedTower();
+  towers.forEach((t) => { if (t.rangeIndicator) t.rangeIndicator.visible = false; });
 }
 
 function updateRangePreview() {
@@ -626,9 +718,6 @@ function update(dt: number, time: number) {
     if (!e.alive) {
       scene.remove(e.group);
       gameState.enemiesAlive--;
-      if (!e.reachedCore) {
-        // Was killed by towers
-      }
       return false;
     }
     return true;
@@ -639,10 +728,31 @@ function update(dt: number, time: number) {
 
   // Update projectiles
   const { kills, rewards } = updateProjectiles(dt, enemies, scene);
-  gameState.totalEnemiesKilled += kills;
-  gameState.enemiesKilled += kills;
-  gameState.credits += rewards;
-  gameState.score += kills * 50 + rewards;
+
+  // Process kills with combo system
+  if (kills > 0) {
+    for (let i = 0; i < kills; i++) {
+      const avgReward = Math.floor(rewards / kills);
+      const { bonusCredits, scoreMultiplier, comboText } = registerKill(combo, time, avgReward);
+      gameState.credits += bonusCredits;
+      gameState.score += Math.floor(50 * scoreMultiplier);
+      sessionStats.totalKills++;
+      stats.totalKills++;
+      if (combo.multiplier > sessionStats.maxCombo) sessionStats.maxCombo = combo.multiplier;
+      if (combo.multiplier > stats.maxCombo) stats.maxCombo = combo.multiplier;
+      if (comboText) {
+        hud.showNotification(comboText, "#ffcc00", 1500);
+        triggerShake(0.2);
+      }
+    }
+    gameState.totalEnemiesKilled += kills;
+    gameState.enemiesKilled += kills;
+    gameState.credits += rewards;
+    sessionStats.totalCreditsEarned += rewards;
+  }
+
+  // Update combo state
+  updateCombo(combo, time);
 
   // Animate towers
   animateTowers(towers, time);

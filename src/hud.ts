@@ -341,12 +341,25 @@ export function createHUD(callbacks: {
   titleScreen.innerHTML = `
     <div class="nb-title">NEON BASTION</div>
     <div class="nb-subtitle">VR TOWER DEFENSE</div>
-    <button class="nb-start-btn" id="nb-start">START GAME</button>
+    <div style="display:flex;gap:12px;margin-bottom:30px">
+      <button class="nb-start-btn nb-diff-btn" data-diff="easy" style="padding:12px 24px;font-size:12px">
+        [1] EASY<br><span style="font-size:8px;opacity:0.5">Relaxed pace</span>
+      </button>
+      <button class="nb-start-btn nb-diff-btn" data-diff="normal" style="padding:12px 24px;font-size:12px;border-color:#00ffff">
+        [2] NORMAL<br><span style="font-size:8px;opacity:0.5">Balanced</span>
+      </button>
+      <button class="nb-start-btn nb-diff-btn" data-diff="hard" style="padding:12px 24px;font-size:12px;border-color:#ff4444;color:#ff4444">
+        [3] HARD<br><span style="font-size:8px;opacity:0.5">Veterans only</span>
+      </button>
+      <button class="nb-start-btn nb-diff-btn" data-diff="endless" style="padding:12px 24px;font-size:12px;border-color:#ffcc00;color:#ffcc00">
+        [4] ENDLESS<br><span style="font-size:8px;opacity:0.5">Survive</span>
+      </button>
+    </div>
     <div class="nb-controls-hint">
       WASD — Move &nbsp;|&nbsp; Mouse — Look<br>
       1-6 — Select Tower &nbsp;|&nbsp; Click — Place<br>
       U — Upgrade &nbsp;|&nbsp; X — Sell &nbsp;|&nbsp; SPACE — Start Wave<br>
-      ESC — Pause
+      ESC — Pause &nbsp;|&nbsp; Right Click — Deselect
     </div>
   `;
   document.body.appendChild(titleScreen);
@@ -364,7 +377,9 @@ export function createHUD(callbacks: {
   document.body.appendChild(towerInfo);
 
   // Event listeners
-  document.getElementById("nb-start")?.addEventListener("click", () => onStartGame?.());
+  document.querySelectorAll(".nb-diff-btn").forEach((btn) => {
+    btn.addEventListener("click", () => onStartGame?.());
+  });
 
   // Keyboard shortcuts
   document.addEventListener("keydown", (e) => {
